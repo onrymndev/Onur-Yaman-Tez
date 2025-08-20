@@ -167,3 +167,102 @@ def wgan_gp_shap_weighted(
         print(f"After ENN: {X_out.shape}, Balance: {np.bincount(y_out.astype(int))}")
 
     return X_out, y_out
+
+
+def wgan_gp_shap_balance(
+    X_train,
+    y_train,
+    apply_enn=True,
+    n_epochs=200,
+    batch_size=128,
+    critic_iterations=5,
+    lr=1e-4
+):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    input_dim = X_train.shape[1]
+
+    # --- Train LightGBM to get SHAP importances for minority class ---
+    lgb = LGBMClassifier(n_estimators=300)
+    lgb.fit(X_train, y_train)
+    
+    explainer = shap.TreeExplainer(lgb)
+    shap_values = explainer.shap_values(X_train)  # list of arrays per class
+    # Absolute mean of SHAP values for minority class (assume class 1)
+    minority_shap = np.abs(shap_values[1]).mean(axis=0)
+    feature_weights = minority_shap / minority_shap.sum()  # normalized
+
+    # --- Use only real minority class samples ---
+    y_tr = y_train.ravel()
+    X_minority = np.array([X_train[i] for i in range(len(y_tr)) if int(y_tr[i]) == 1])
+    n_minority = len(X_minority)
+    n_majority = np.sum(y_tr == 0)
+    n_generate = n_majority - n_minority  # exactly balance classes
+
+    y_real = np.ones(n_minority)
+    tensor_x = torch.Tensor(X_minority)
+    tensor_y = torch.Tensor(y_real)
+    dataset = TensorDataset(tensor_x, tensor_y)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    label_dim = 1
+    gen = ConditionalGenerator(z_dim=input_dim, label_dim=label_dim, im_dim=input_dim).to(device)
+    critic = ConditionalCritic(im_dim=input_dim, label_dim=label_dim).to(device)
+
+    gen_opt = torch.optim.Adam(gen.parameters(), lr=lr, betas=(0.0, 0.9))
+    critic_opt = torch.optim.Adam(critic.parameters(), lr=lr, betas=(0.0, 0.9))
+
+    # === Train WGAN-GP ===
+    for epoch in range(n_epochs):
+        for real, _ in tqdm(dataloader, leave=False):
+            real = real.to(device)
+            real_labels = torch.ones((real.size(0), 1)).to(device)
+
+            for _ in range(critic_iterations):
+                z = torch.randn(real.size(0), input_dim).to(device)
+                z = z * torch.tensor(np.sqrt(feature_weights), device=device)
+                noise_labels = torch.ones((real.size(0), 1)).to(device)
+                fake = gen(z, noise_labels)
+
+                critic_real = critic(real, real_labels).mean()
+                critic_fake = critic(fake.detach(), noise_labels).mean()
+                gp = gradient_penalty(critic, real, fake.detach(), real_labels, device)
+
+                critic_loss = -(critic_real - critic_fake) + gp
+                critic_opt.zero_grad()
+                critic_loss.backward()
+                critic_opt.step()
+
+            # Generator update
+            z = torch.randn(real.size(0), input_dim).to(device)
+            z = z * torch.tensor(np.sqrt(feature_weights), device=device)
+            noise_labels = torch.ones((real.size(0), 1)).to(device)
+            gen_fake = gen(z, noise_labels)
+            gen_loss = -critic(gen_fake, noise_labels).mean()
+
+            gen_opt.zero_grad()
+            gen_loss.backward()
+            gen_opt.step()
+
+        print(f"Epoch {epoch} | Gen Loss: {gen_loss.item():.4f}, Critic Loss: {critic_loss.item():.4f}")
+
+    # === Generate synthetic samples to balance classes ===
+    with torch.no_grad():
+        z = torch.randn(n_generate, input_dim).to(device)
+        z = z * torch.tensor(np.sqrt(feature_weights), device=device)
+        noise_labels = torch.ones((n_generate, 1)).to(device)
+        generated = gen(z, noise_labels).cpu().numpy()
+
+    # === Combine real data with synthetic samples ===
+    final_data = np.concatenate((X_train, generated), axis=0)
+    final_labels = np.concatenate((y_train, np.ones(n_generate)), axis=0)
+    X_out, y_out = shuffle_in_unison(final_data, final_labels)
+
+    # === Optional: Clean with ENN ===
+    if apply_enn:
+        print(f"Before ENN: {X_out.shape}, Balance: {np.bincount(y_out.astype(int))}")
+        enn = EditedNearestNeighbours()
+        X_out, y_out = enn.fit_resample(X_out, y_out)
+        print(f"After ENN: {X_out.shape}, Balance: {np.bincount(y_out.astype(int))}")
+
+    return X_out, y_out
+
